@@ -1,55 +1,101 @@
 # L3B Architecture Record
 
-Team phải cập nhật tài liệu này cùng source. Mục tiêu là mô tả quyết định có thể kiểm chứng, không ghi prompt bí mật hoặc chain-of-thought.
+## System overview
 
-## 1. System overview
-
-Vẽ hoặc mô tả luồng từ input/candidate resolution đến MCP investigation, specialist agents, conflict resolver, verifier, output và trace.
+This repository implements a pure-Python async state machine. The coordinator
+routes a case and resolves its candidate order IDs. Once one order is resolved,
+the Order/Item, Payment, and Shipment agents collect their evidence in parallel.
+The Policy agent consumes only those records, and the Verifier creates the
+contract-safe output.
 
 ```text
-Input → Entity Resolver → Coordinator → Specialists → Conflict Resolver → Verifier → Output
-            │                              │                  │             │
-            └──────────────────────────── MCP ────────────────┴──────────── Trace
+Input → Coordinator / Router → Order/Item Agent ┐
+              │ handoff          Payment Agent ─┼→ Policy Agent → Verifier → output
+              └→ Entity resolution Shipment Agent┘                     │
+                        │                     MCP evidence             └→ trace.jsonl
+                        └─ rejected candidates
 ```
 
-## 2. Agent ownership
+The JSON Schema files in `contracts/schemas/` are the public source of truth.
+The workflow never adds implementation fields to outputs, traces, manifests, or
+MCP envelopes.
 
-| Actor | Input | Trách nhiệm | Tool permission | Output/handoff |
+## Agent ownership and permissions
+
+| Actor | Input | Responsibility | Permission | Handoff |
 | --- | --- | --- | --- | --- |
-| Entity/customer | TODO | TODO | TODO | TODO |
-| Coordinator | TODO | TODO | TODO | TODO |
-| Order/product | TODO | TODO | TODO | TODO |
-| Shipment | TODO | TODO | TODO | TODO |
-| Payment/refund | TODO | TODO | TODO | TODO |
-| Policy | TODO | TODO | TODO | TODO |
-| Conflict resolver | TODO | TODO | TODO | TODO |
-| Verifier | TODO | TODO | TODO | TODO |
+| Coordinator | case and candidate IDs | bound entity resolution and routing | discovered order lookup | resolution to specialists |
+| Order/Item | resolved order ID | items, sellers, products | one discovered item tool | evidence to policy |
+| Payment | resolved order ID | captures, duplicate/refund state | one discovered payment tool | evidence to policy |
+| Shipment | resolved order ID | delivery timeline | one discovered shipment tool | evidence to policy |
+| Customer | enabled hint | related orders | discovered customer tool | evidence to verifier |
+| Policy | version and evidence | policy interpretation | discovered policy tool | evidence to verifier |
+| Verifier | collected records | output assembly and invariants | none | output and trace |
 
-Áp dụng least privilege; tool discovery không đồng nghĩa mọi actor đều được gọi mọi tool.
+Discovery is not blanket permission: each role selects at most one discovered,
+role-appropriate tool. A missing tool is not guessed or called.
 
-## 3. Entity resolution và A2A protocol
+## Entity resolution and A2A protocol
 
-Mô tả cách xếp hạng/reject candidate, confidence threshold, message envelope, correlation theo `case_id`, điều kiện handoff, timeout và cách tránh vòng lặp. Không trace nội dung suy luận riêng.
+The coordinator considers only supplied candidates, with a hard maximum of five.
+It accepts an order only when its authoritative response contains that ID. For a
+single candidate, one successful exact lookup also resolves that candidate. All
+other candidates are rejected. If zero or multiple IDs remain, the outcome is
+`not_found` or `ambiguous`, and order-scoped specialists are skipped.
 
-## 4. Evidence và conflict lifecycle
+Every inter-agent handoff carries the case through `case_id` and emits a
+`handoff` trace event. The path is strictly acyclic: coordinator → specialists
+→ policy → verifier. There is no automatic retry: MCP retries can double audit
+cost and make non-idempotent behavior unsafe.
 
-Mô tả cách validate MCP response, lưu `evidence_ref`, chọn source theo policy, biểu diễn unresolved conflict, map evidence vào claim/output và emit `tool_result_consumed`. Evidence không được tái sử dụng giữa các case.
+## Evidence and conflicts
 
-## 5. Failure and efficiency policy
+`EvidenceGateway` validates every MCP response against
+`mcp-evidence-response-v1.schema.json`. A consumed result emits exactly its
+gateway-issued `evidence_ref` in `tool_result_consumed`. References are stored
+only in the current invocation, so evidence cannot cross case boundaries.
 
-| Failure | Retry budget | Fallback | Trace event/code |
+The verifier derives entities, status and amounts from MCP `data` only. Missing
+or conflicting evidence produces `insufficient_evidence`, never a fabricated
+fact. `data_conflicts` stays empty unless an authoritative conflict can be
+represented by the public output contract. Claim evidence, top-level evidence,
+and trace evidence use the same collected references.
+
+## Failure and efficiency policy
+
+| Failure | Retry | Fallback | Observable outcome |
 | --- | ---: | --- | --- |
-| MCP timeout | TODO | TODO | TODO |
-| Entity not found/ambiguous | TODO | TODO | TODO |
-| Source conflict | TODO | TODO | TODO |
-| Invalid specialist result | TODO | TODO | TODO |
+| MCP error or timeout | 0 | omit result; use insufficient evidence | `tool_unavailable` |
+| Unresolved entity | 0 | skip order-scoped specialists | `handoff` with resolution status |
+| Missing/conflicting source | 0 | no speculative refund or action | verifier `contract_safe` |
+| Invalid MCP envelope | 0 | gateway rejects it | unvalidated data never reaches output |
 
-Nêu query budget/cache strategy để tránh gọi lặp và quét rộng. Retry phải có giới hạn, idempotent và không biến missing evidence thành dữ liệu phỏng đoán.
+Tool discovery is cached for a gateway lifetime. Equivalent calls are
+deduplicated in a case; candidate resolution is capped; only independent
+specialist calls run concurrently. No cross-case cache is used.
 
-## 6. Verification invariants
+## Verification invariants
 
-Liệt kê kiểm tra trước finalize: schema, entity scope, rejected candidates, evidence ownership, claim linkage, timeline, payment/refund totals, source precedence, responsibility/action consistency và confidence bounds.
+- Required fields and field names match `l3b-output-v2.schema.json` exactly.
+- Output `case_id`, evidence references, and trace events remain case-scoped.
+- Resolved and rejected candidates are disjoint.
+- Entity, shipment, payment and customer values come from evidence.
+- Monetary values are non-negative BRL; confidence remains in `[0, 1]`.
+- Missing timeline/evidence maps to `needs_investigation`, not an invented conclusion.
+- The CLI re-validates output, trace and manifest before persistence/package.
 
-## 7. Reproducibility
+## Reproducibility
 
-Ghi model/config, dependency pinning, concurrency limit, random seed (nếu có), lệnh chạy và giới hạn tài nguyên. Không ghi API key.
+Python 3.11+ and dependency ranges are declared in `pyproject.toml`. The
+workflow uses no model call, random seed, or secret-bearing logs. Its concurrent
+branch has at most four independent calls (three specialists plus customer).
+
+```bash
+python -m pip install -e ".[dev]"
+day09 validate-inputs
+day09 run
+day09 validate
+day09 package --output dist/submission.zip
+```
+
+The Team API key remains in `.env` and is never written to a submission or trace.

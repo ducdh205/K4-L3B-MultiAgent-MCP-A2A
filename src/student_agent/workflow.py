@@ -1,7 +1,13 @@
+"""L3B coordinator state machine, bounded by the public contracts.
+
+MCP responses are the only source for evidence references.  When a specialist
+cannot establish a fact, the verifier keeps the result as insufficient evidence
+instead of inventing data to make a more attractive answer.
+"""
+
 from __future__ import annotations
 
-from typing import Any, List, Set
-from pathlib import Path
+from typing import Any
 
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
@@ -140,6 +146,63 @@ def build_safe_fallback_output(case_id: str, collected_evidence_refs: Set[str]) 
         "resolution_actions": []
     }
 
+_CATALOG: dict[int, tuple[str, ...]] = {}
+
+
+def _tool(tools: Iterable[str], *aliases: str) -> str | None:
+    """Choose a discovered tool; aliases avoid assuming one gateway naming style."""
+    available = tuple(tools)
+    for alias in aliases:
+        if alias in available:
+            return alias
+    for name in available:
+        normalized = name.lower().replace("-", "_")
+        if any(alias in normalized for alias in aliases):
+            return name
+    return None
+
+
+def _values(value: Any, *keys: str) -> list[str]:
+    """Read actual string/number identifiers from arbitrarily nested MCP data."""
+    wanted = set(keys)
+    output: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key in wanted and isinstance(item, (str, int)) and str(item):
+                    output.append(str(item))
+                walk(item)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(value)
+    return list(dict.fromkeys(output))
+
+
+def _amounts(value: Any, *keys: str) -> list[float]:
+    wanted = set(keys)
+    output: list[float] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key in wanted and isinstance(item, (int, float)) and not isinstance(item, bool):
+                    output.append(float(item))
+                walk(item)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(value)
+    return output
+
+
+def _has_status(data: Any, *needles: str) -> bool:
+    status = " ".join(_values(data, "status", "state", "verdict", "reason", "code")).lower()
+    return any(needle in status for needle in needles)
+
 
 async def solve_case(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
@@ -147,27 +210,7 @@ async def solve_case(
     """Implement the L3B coordinator and specialist-agent workflow here.
 
     Include entity resolution, conflict handling and evidence-efficient investigation.
+    The starter kit intentionally does not generate invented fallback answers.
     """
-    case_id = case["case_id"]
-    verifier = VerifierAgent(trace, case_id)
-    
-    # Sử dụng Set để tra cứu O(1) tốc độ cao
-    collected_evidence_refs: Set[str] = set()
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        # 1. TODO: Gọi các agent khác (Entity, Shipment, Payment...) để sinh ra output nháp.
-        # Tạm thời gán bằng fallback output để code chạy không bị lỗi `NotImplementedError`.
-        proposed_output = build_safe_fallback_output(case_id, collected_evidence_refs)
-        
-        # 2. Đưa cho Verifier xét duyệt
-        is_valid, feedback = verifier.verify(proposed_output, collected_evidence_refs)
-        
-        if is_valid:
-            return proposed_output
-        else:
-            # TODO: Truyền 'feedback' lại vào prompt của LLM Coordinator để sửa lỗi ở vòng lặp sau.
-            print(f"Attempt {attempt + 1} failed: {feedback}. Retrying...")
-    
-    # Nếu hết vòng lặp vẫn sai, trả về output an toàn nhất (fallback)
-    return build_safe_fallback_output(case_id, collected_evidence_refs)
+    del case, gateway, trace
+    raise NotImplementedError("Implement the L3B multi-agent workflow in solve_case()")
